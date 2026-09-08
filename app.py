@@ -15,7 +15,7 @@ import yt_dlp
 
 app = FastAPI(
     title="Video Downloader for CSR API",
-    version="2.1.0",
+    version="3.0.0",
 )
 
 
@@ -38,6 +38,11 @@ jobs_lock = threading.Lock()
 
 class VideoInfoRequest(BaseModel):
     url: str
+
+
+class DirectRequest(BaseModel):
+    url: str
+    format_id: str
 
 
 class DownloadRequest(BaseModel):
@@ -172,6 +177,13 @@ def validate_url(url):
     return url
 
 
+def safe_float(value):
+    try:
+        return float(value)
+    except Exception:
+        return 0.0
+
+
 def format_size(value):
     if value is None:
         return None
@@ -200,11 +212,39 @@ def get_format_size(fmt):
     )
 
 
-def safe_float(value):
-    try:
-        return float(value)
-    except Exception:
-        return 0.0
+def sanitize_filename(name):
+    name = str(name or "CSR_Download")
+
+    name = name.replace(
+        "/",
+        "_",
+    )
+
+    name = name.replace(
+        "\\",
+        "_",
+    )
+
+    for char in (
+        ":",
+        "*",
+        "?",
+        '"',
+        "<",
+        ">",
+        "|",
+    ):
+        name = name.replace(
+            char,
+            "_",
+        )
+
+    name = name.strip()
+
+    if not name:
+        name = "CSR_Download"
+
+    return name
 
 
 # ============================================================
@@ -239,7 +279,148 @@ def extract_info(url):
         return info, cookie_source
 
     finally:
-        delete_cookie_file(cookie_file)
+        delete_cookie_file(
+            cookie_file
+        )
+
+
+# ============================================================
+# FORMAT HELPERS
+# ============================================================
+
+def find_format(info, format_id):
+    for fmt in info.get("formats") or []:
+        if str(fmt.get("format_id")) == str(
+            format_id
+        ):
+            return fmt
+
+    return None
+
+
+def is_video(fmt):
+    codec = fmt.get("vcodec")
+
+    return bool(
+        codec
+        and codec != "none"
+    )
+
+
+def is_audio(fmt):
+    codec = fmt.get("acodec")
+
+    return bool(
+        codec
+        and codec != "none"
+    )
+
+
+def is_audio_only(fmt):
+    return (
+        is_audio(fmt)
+        and not is_video(fmt)
+    )
+
+
+def is_video_only(fmt):
+    return (
+        is_video(fmt)
+        and not is_audio(fmt)
+    )
+
+
+def is_progressive(fmt):
+    return (
+        is_video(fmt)
+        and is_audio(fmt)
+    )
+
+
+def get_direct_url(fmt):
+    url = fmt.get("url")
+
+    if not url:
+        return None
+
+    protocol = str(
+        fmt.get("protocol")
+        or ""
+    ).lower()
+
+    # Direct phone download is intended for ordinary
+    # HTTP(S) media URLs.
+    if protocol.startswith("m3u8"):
+        return None
+
+    if protocol.startswith("http"):
+        return url
+
+    # Some yt-dlp formats may not expose protocol
+    # consistently. Accept an explicit HTTP(S) URL.
+    if (
+        str(url).startswith("https://")
+        or str(url).startswith("http://")
+    ):
+        return url
+
+    return None
+
+
+def choose_audio_for_video(info, video_fmt):
+    candidates = []
+
+    for fmt in info.get("formats") or []:
+
+        if not is_audio_only(fmt):
+            continue
+
+        candidates.append(fmt)
+
+    if not candidates:
+        return None
+
+    video_ext = str(
+        video_fmt.get("ext")
+        or ""
+    ).lower()
+
+    if video_ext == "mp4":
+
+        m4a = [
+            f
+            for f in candidates
+            if str(
+                f.get("ext") or ""
+            ).lower() == "m4a"
+        ]
+
+        if m4a:
+            candidates = m4a
+
+    elif video_ext == "webm":
+
+        webm = [
+            f
+            for f in candidates
+            if str(
+                f.get("ext") or ""
+            ).lower() == "webm"
+        ]
+
+        if webm:
+            candidates = webm
+
+    candidates.sort(
+        key=lambda x: safe_float(
+            x.get("abr")
+            or x.get("tbr")
+            or 0
+        ),
+        reverse=True,
+    )
+
+    return candidates[0]
 
 
 # ============================================================
@@ -256,20 +437,49 @@ def build_formats(info):
     seen_audio = set()
 
     for fmt in formats:
-        format_id = fmt.get("format_id")
+
+        format_id = fmt.get(
+            "format_id"
+        )
 
         if not format_id:
             continue
 
-        vcodec = fmt.get("vcodec")
-        acodec = fmt.get("acodec")
-        ext = fmt.get("ext")
-        height = fmt.get("height")
-        width = fmt.get("width")
-        fps = fmt.get("fps")
-        abr = fmt.get("abr")
-        tbr = fmt.get("tbr")
-        filesize = get_format_size(fmt)
+        vcodec = fmt.get(
+            "vcodec"
+        )
+
+        acodec = fmt.get(
+            "acodec"
+        )
+
+        ext = fmt.get(
+            "ext"
+        )
+
+        height = fmt.get(
+            "height"
+        )
+
+        width = fmt.get(
+            "width"
+        )
+
+        fps = fmt.get(
+            "fps"
+        )
+
+        abr = fmt.get(
+            "abr"
+        )
+
+        tbr = fmt.get(
+            "tbr"
+        )
+
+        filesize = get_format_size(
+            fmt
+        )
 
         has_video = (
             vcodec
@@ -286,6 +496,11 @@ def build_formats(info):
         # ----------------------------------------------------
 
         if has_video and height:
+
+            direct_url = get_direct_url(
+                fmt
+            )
+
             key = (
                 int(height),
                 ext,
@@ -296,35 +511,69 @@ def build_formats(info):
                 ),
             )
 
-            if key not in seen_video:
-                seen_video.add(key)
+            if key in seen_video:
+                continue
 
-                video.append({
-                    "format_id": str(format_id),
-                    "height": int(height),
-                    "width": (
-                        int(width)
-                        if width
-                        else None
-                    ),
-                    "fps": fps,
-                    "ext": ext,
-                    "has_audio": bool(has_audio),
-                    "video_codec": vcodec,
-                    "audio_codec": acodec,
-                    "filesize": filesize,
-                    "filesize_mb": format_size(
-                        filesize
-                    ),
-                    "tbr": tbr,
-                })
+            seen_video.add(key)
+
+            video.append({
+                "format_id": str(
+                    format_id
+                ),
+
+                "height": int(
+                    height
+                ),
+
+                "width": (
+                    int(width)
+                    if width
+                    else None
+                ),
+
+                "fps": fps,
+
+                "ext": ext,
+
+                "has_audio": bool(
+                    has_audio
+                ),
+
+                "video_codec": vcodec,
+
+                "audio_codec": acodec,
+
+                "filesize": filesize,
+
+                "filesize_mb": format_size(
+                    filesize
+                ),
+
+                "tbr": tbr,
+
+                "direct_download": bool(
+                    direct_url
+                ),
+
+                "needs_merge": (
+                    not bool(has_audio)
+                ),
+            })
 
         # ----------------------------------------------------
         # AUDIO
         # ----------------------------------------------------
 
         elif has_audio and not has_video:
-            bitrate = abr or tbr
+
+            bitrate = (
+                abr
+                or tbr
+            )
+
+            direct_url = get_direct_url(
+                fmt
+            )
 
             key = (
                 str(format_id),
@@ -335,26 +584,41 @@ def build_formats(info):
                 ),
             )
 
-            if key not in seen_audio:
-                seen_audio.add(key)
+            if key in seen_audio:
+                continue
 
-                audio.append({
-                    "format_id": str(format_id),
-                    "bitrate_kbps": (
-                        round(
-                            safe_float(bitrate),
-                            1,
-                        )
-                        if bitrate
-                        else None
-                    ),
-                    "ext": ext,
-                    "audio_codec": acodec,
-                    "filesize": filesize,
-                    "filesize_mb": format_size(
-                        filesize
-                    ),
-                })
+            seen_audio.add(key)
+
+            audio.append({
+                "format_id": str(
+                    format_id
+                ),
+
+                "bitrate_kbps": (
+                    round(
+                        safe_float(
+                            bitrate
+                        ),
+                        1,
+                    )
+                    if bitrate
+                    else None
+                ),
+
+                "ext": ext,
+
+                "audio_codec": acodec,
+
+                "filesize": filesize,
+
+                "filesize_mb": format_size(
+                    filesize
+                ),
+
+                "direct_download": bool(
+                    direct_url
+                ),
+            })
 
     video.sort(
         key=lambda x: (
@@ -379,12 +643,14 @@ def build_formats(info):
 # ============================================================
 
 def create_job():
+
     job_id = uuid.uuid4().hex
 
     job = {
         "id": job_id,
 
         "status": "queued",
+
         "stage": "QUEUED",
 
         "message": "Download job created.",
@@ -392,24 +658,33 @@ def create_job():
         "progress": 0,
 
         "downloaded_bytes": 0,
+
         "total_bytes": None,
 
         "speed": None,
+
         "eta": None,
 
         "filename": None,
+
         "file_path": None,
 
         "error_type": None,
+
         "error": None,
+
         "error_details": None,
 
         "worker_started": False,
+
         "worker_thread": None,
 
         "created_at": time.time(),
+
         "started_at": None,
+
         "completed_at": None,
+
         "updated_at": time.time(),
     }
 
@@ -420,19 +695,32 @@ def create_job():
 
 
 def update_job(job_id, **values):
+
     with jobs_lock:
-        job = jobs.get(job_id)
+
+        job = jobs.get(
+            job_id
+        )
 
         if not job:
             return
 
-        job.update(values)
-        job["updated_at"] = time.time()
+        job.update(
+            values
+        )
+
+        job["updated_at"] = (
+            time.time()
+        )
 
 
 def get_job(job_id):
+
     with jobs_lock:
-        job = jobs.get(job_id)
+
+        job = jobs.get(
+            job_id
+        )
 
         if not job:
             return None
@@ -441,19 +729,26 @@ def get_job(job_id):
 
 
 def cleanup_old_jobs():
+
     now = time.time()
 
     with jobs_lock:
+
         old_ids = []
 
         for job_id, job in jobs.items():
+
             if (
-                now - job["updated_at"]
+                now
+                - job["updated_at"]
                 > JOB_RETENTION_SECONDS
             ):
-                old_ids.append(job_id)
+                old_ids.append(
+                    job_id
+                )
 
         for job_id in old_ids:
+
             job = jobs.pop(
                 job_id,
                 None,
@@ -462,17 +757,10 @@ def cleanup_old_jobs():
             if not job:
                 continue
 
-            file_path = job.get(
-                "file_path"
+            job_dir = (
+                BASE_DIR
+                / job_id
             )
-
-            if file_path:
-                try:
-                    os.remove(file_path)
-                except Exception:
-                    pass
-
-            job_dir = BASE_DIR / job_id
 
             try:
                 shutil.rmtree(
@@ -483,120 +771,73 @@ def cleanup_old_jobs():
                 pass
 
 
-# ============================================================
-# FORMAT VALIDATION
-# ============================================================
+def count_active_jobs():
 
-def find_format(info, format_id):
-    formats = info.get("formats") or []
+    active = {
+        "queued",
+        "processing",
+        "downloading",
+    }
 
-    for fmt in formats:
-        if str(fmt.get("format_id")) == str(
-            format_id
-        ):
-            return fmt
+    with jobs_lock:
 
-    return None
-
-
-def choose_audio_for_video(info, video_fmt):
-    formats = info.get("formats") or []
-
-    video_ext = video_fmt.get("ext")
-
-    candidates = []
-
-    for fmt in formats:
-        vcodec = fmt.get("vcodec")
-        acodec = fmt.get("acodec")
-        ext = fmt.get("ext")
-
-        if (
-            acodec
-            and acodec != "none"
-            and (
-                not vcodec
-                or vcodec == "none"
-            )
-        ):
-            candidates.append(fmt)
-
-    if not candidates:
-        return None
-
-    # MP4 video -> prefer M4A audio.
-    if video_ext == "mp4":
-        m4a = [
-            f
-            for f in candidates
-            if f.get("ext") == "m4a"
-        ]
-
-        if m4a:
-            candidates = m4a
-
-    # WebM video -> prefer WebM audio.
-    elif video_ext == "webm":
-        webm = [
-            f
-            for f in candidates
-            if f.get("ext") == "webm"
-        ]
-
-        if webm:
-            candidates = webm
-
-    candidates.sort(
-        key=lambda x: (
-            safe_float(
-                x.get("abr")
-                or x.get("tbr")
-                or 0
-            )
-        ),
-        reverse=True,
-    )
-
-    return candidates[0]
+        return sum(
+            1
+            for job in jobs.values()
+            if job.get("status")
+            in active
+        )
 
 
 # ============================================================
-# PROGRESS HOOK
+# PROGRESS
 # ============================================================
 
 def make_progress_hook(job_id):
 
     def hook(data):
+
         try:
-            status = data.get("status")
+
+            status = data.get(
+                "status"
+            )
 
             if status == "downloading":
+
                 downloaded = (
-                    data.get("downloaded_bytes")
+                    data.get(
+                        "downloaded_bytes"
+                    )
                     or 0
                 )
 
                 total = (
-                    data.get("total_bytes")
+                    data.get(
+                        "total_bytes"
+                    )
                     or data.get(
                         "total_bytes_estimate"
                     )
                 )
 
                 if total:
+
                     percent = (
-                        downloaded / total
+                        downloaded
+                        / total
                     ) * 100
 
                     percent = max(
                         0,
-                        min(100, percent),
+                        min(
+                            100,
+                            percent,
+                        ),
                     )
+
                 else:
                     percent = None
-
-                speed = data.get("speed")
-                eta = data.get("eta")
 
                 update_job(
                     job_id,
@@ -606,7 +847,8 @@ def make_progress_hook(job_id):
                     stage="DOWNLOADING",
 
                     message=(
-                        "Downloading media."
+                        "Downloading media "
+                        "on server."
                     ),
 
                     progress=percent,
@@ -615,12 +857,17 @@ def make_progress_hook(job_id):
 
                     total_bytes=total,
 
-                    speed=speed,
+                    speed=data.get(
+                        "speed"
+                    ),
 
-                    eta=eta,
+                    eta=data.get(
+                        "eta"
+                    ),
                 )
 
             elif status == "finished":
+
                 update_job(
                     job_id,
 
@@ -630,35 +877,36 @@ def make_progress_hook(job_id):
 
                     message=(
                         "Media download finished. "
-                        "Processing output file."
+                        "Processing output."
                     ),
 
                     progress=100,
                 )
 
         except Exception:
-            # A progress-hook error must NEVER
-            # terminate the actual yt-dlp download.
             pass
 
     return hook
 
 
 # ============================================================
-# DOWNLOAD WORKER
+# SERVER-SIDE DOWNLOAD WORKER
 # ============================================================
 
 def download_worker(
     job_id,
     request_data,
 ):
+
     cookie_file = None
 
     output_dir = (
-        BASE_DIR / job_id
+        BASE_DIR
+        / job_id
     )
 
     try:
+
         output_dir.mkdir(
             parents=True,
             exist_ok=True,
@@ -680,34 +928,32 @@ def download_worker(
             stage="WORKER_STARTED",
 
             message=(
-                "Download worker started."
+                "Server-side processing worker started."
             ),
         )
 
-        url = request_data["url"]
+        url = request_data[
+            "url"
+        ]
 
-        mode = request_data["mode"]
+        mode = request_data[
+            "mode"
+        ]
 
-        requested_format_id = (
-            request_data.get(
-                "format_id"
-            )
+        format_id = request_data.get(
+            "format_id"
         )
 
-        audio_codec = (
-            request_data.get(
-                "audio_codec"
-            )
+        audio_codec = request_data.get(
+            "audio_codec"
         )
 
-        audio_bitrate = (
-            request_data.get(
-                "audio_bitrate"
-            )
+        audio_bitrate = request_data.get(
+            "audio_bitrate"
         )
 
         # ----------------------------------------------------
-        # EXTRACT INFORMATION AGAIN
+        # RE-EXTRACT
         # ----------------------------------------------------
 
         update_job(
@@ -716,18 +962,23 @@ def download_worker(
             stage="EXTRACTING",
 
             message=(
-                "Extracting media information "
-                "again for format validation."
+                "Re-extracting media information "
+                "for server-side processing."
             ),
         )
 
-        info, cookie_source = extract_info(
+        info, _ = extract_info(
             url
         )
 
-        if not info:
+        selected = find_format(
+            info,
+            format_id
+        )
+
+        if not selected:
             raise RuntimeError(
-                "yt-dlp returned no media information."
+                "Selected format is no longer available."
             )
 
         # ----------------------------------------------------
@@ -736,44 +987,40 @@ def download_worker(
 
         if mode == "audio":
 
-            selected = find_format(
-                info,
-                requested_format_id,
-            )
-
-            if not selected:
-                raise RuntimeError(
-                    "The selected audio format "
-                    "is no longer available."
-                )
-
-            selected_acodec = (
-                selected.get("acodec")
-            )
-
-            if (
-                not selected_acodec
-                or selected_acodec == "none"
+            if not is_audio_only(
+                selected
             ):
                 raise RuntimeError(
-                    "The selected format is "
-                    "not an audio-only format."
+                    "Selected format is not "
+                    "an audio-only format."
                 )
 
-            update_job(
-                job_id,
+            if audio_codec != "mp3":
+                raise RuntimeError(
+                    "Server-side audio processing "
+                    "currently supports MP3 only."
+                )
 
-                stage="FORMAT_VALIDATION",
-
-                message=(
-                    "Audio format validated: "
-                    + str(
-                        selected.get(
-                            "format_id"
-                        )
-                    )
-                ),
+            bitrate = (
+                int(audio_bitrate)
+                if audio_bitrate
+                else 192
             )
+
+            allowed = {
+                320,
+                256,
+                192,
+                128,
+                96,
+            }
+
+            if bitrate not in allowed:
+                raise RuntimeError(
+                    "Unsupported MP3 bitrate. "
+                    "Allowed values: "
+                    "320, 256, 192, 128, 96."
+                )
 
             cookie_file, _ = (
                 prepare_cookie_file()
@@ -785,6 +1032,7 @@ def download_worker(
             )
 
             options = {
+
                 "quiet": True,
 
                 "no_warnings": True,
@@ -815,99 +1063,19 @@ def download_worker(
 
                 "concurrent_fragment_downloads": 4,
 
-                "postprocessor_args": [],
+                "postprocessors": [
+                    {
+                        "key":
+                            "FFmpegExtractAudio",
+
+                        "preferredcodec":
+                            "mp3",
+
+                        "preferredquality":
+                            str(bitrate),
+                    }
+                ],
             }
-
-            # ------------------------------------------------
-            # MP3
-            # ------------------------------------------------
-
-            if audio_codec == "mp3":
-
-                bitrate = (
-                    int(audio_bitrate)
-                    if audio_bitrate
-                    else 192
-                )
-
-                allowed_bitrates = {
-                    320,
-                    256,
-                    192,
-                    128,
-                    96,
-                }
-
-                if bitrate not in allowed_bitrates:
-                    raise RuntimeError(
-                        "Unsupported MP3 bitrate. "
-                        "Allowed values are "
-                        "320, 256, 192, 128 and 96 kbps."
-                    )
-
-                options[
-                    "postprocessors"
-                ] = [
-                    {
-                        "key":
-                        "FFmpegExtractAudio",
-
-                        "preferredcodec":
-                        "mp3",
-
-                        "preferredquality":
-                        str(bitrate),
-                    }
-                ]
-
-            # ------------------------------------------------
-            # M4A
-            # ------------------------------------------------
-
-            elif audio_codec == "m4a":
-
-                options[
-                    "postprocessors"
-                ] = [
-                    {
-                        "key":
-                        "FFmpegExtractAudio",
-
-                        "preferredcodec":
-                        "m4a",
-
-                        "preferredquality":
-                        "0",
-                    }
-                ]
-
-            # ------------------------------------------------
-            # OPUS
-            # ------------------------------------------------
-
-            elif audio_codec == "opus":
-
-                options[
-                    "postprocessors"
-                ] = [
-                    {
-                        "key":
-                        "FFmpegExtractAudio",
-
-                        "preferredcodec":
-                        "opus",
-
-                        "preferredquality":
-                        "0",
-                    }
-                ]
-
-            else:
-                raise RuntimeError(
-                    "Invalid audio codec. "
-                    "Supported values are "
-                    "mp3, m4a and opus."
-                )
 
             update_job(
                 job_id,
@@ -915,7 +1083,8 @@ def download_worker(
                 stage="DOWNLOADING",
 
                 message=(
-                    "Starting audio download."
+                    "Downloading source audio "
+                    "for MP3 conversion."
                 ),
             )
 
@@ -932,39 +1101,42 @@ def download_worker(
                     0,
                 ):
                     raise RuntimeError(
-                        "yt-dlp returned a non-zero "
-                        "download result: "
+                        "yt-dlp returned non-zero "
+                        "result: "
                         + str(result)
                     )
 
         # ----------------------------------------------------
-        # VIDEO
+        # VIDEO MERGE
         # ----------------------------------------------------
 
         elif mode == "video":
 
-            selected = find_format(
-                info,
-                requested_format_id,
-            )
-
-            if not selected:
-                raise RuntimeError(
-                    "The selected video format "
-                    "is no longer available."
-                )
-
-            vcodec = selected.get(
-                "vcodec"
-            )
-
-            if (
-                not vcodec
-                or vcodec == "none"
+            if not is_video(
+                selected
             ):
                 raise RuntimeError(
-                    "The selected format is "
-                    "not a video format."
+                    "Selected format is not a video format."
+                )
+
+            if not is_video_only(
+                selected
+            ):
+                raise RuntimeError(
+                    "This video format already contains "
+                    "audio and should be downloaded directly "
+                    "to the phone instead of using the server."
+                )
+
+            audio = choose_audio_for_video(
+                info,
+                selected
+            )
+
+            if not audio:
+                raise RuntimeError(
+                    "No compatible audio-only format "
+                    "was found for merging."
                 )
 
             update_job(
@@ -973,68 +1145,29 @@ def download_worker(
                 stage="FORMAT_VALIDATION",
 
                 message=(
-                    "Video format validated: "
+                    "Video-only format validated. "
+                    "Audio format "
                     + str(
-                        selected.get(
+                        audio.get(
                             "format_id"
                         )
                     )
+                    + " selected for merge."
                 ),
             )
 
-            # ------------------------------------------------
-            # SELECT AUDIO WHEN VIDEO IS VIDEO-ONLY
-            # ------------------------------------------------
-
-            if (
-                not selected.get("acodec")
-                or selected.get("acodec")
-                == "none"
-            ):
-
-                audio = choose_audio_for_video(
-                    info,
-                    selected,
-                )
-
-                if not audio:
-                    raise RuntimeError(
-                        "No compatible audio "
-                        "format was found."
-                    )
-
-                final_format = (
-                    str(
-                        selected["format_id"]
-                    )
-                    + "+"
-                    + str(
-                        audio["format_id"]
-                    )
-                )
-
-                update_job(
-                    job_id,
-
-                    stage="FORMAT_VALIDATION",
-
-                    message=(
-                        "Video-only format selected. "
-                        "Compatible audio format "
-                        + str(
-                            audio["format_id"]
-                        )
-                        + " will be merged."
-                    ),
-                )
-
-            else:
-                final_format = str(
-                    selected["format_id"]
-                )
-
             cookie_file, _ = (
                 prepare_cookie_file()
+            )
+
+            final_format = (
+                str(
+                    selected["format_id"]
+                )
+                + "+"
+                + str(
+                    audio["format_id"]
+                )
             )
 
             output_template = (
@@ -1043,6 +1176,7 @@ def download_worker(
             )
 
             options = {
+
                 "quiet": True,
 
                 "no_warnings": True,
@@ -1080,7 +1214,8 @@ def download_worker(
                 stage="DOWNLOADING",
 
                 message=(
-                    "Starting video download."
+                    "Downloading video and audio "
+                    "for server-side merge."
                 ),
             )
 
@@ -1097,8 +1232,8 @@ def download_worker(
                     0,
                 ):
                     raise RuntimeError(
-                        "yt-dlp returned a non-zero "
-                        "download result: "
+                        "yt-dlp returned non-zero "
+                        "result: "
                         + str(result)
                     )
 
@@ -1109,7 +1244,7 @@ def download_worker(
             )
 
         # ----------------------------------------------------
-        # FINALIZING
+        # FINAL FILE
         # ----------------------------------------------------
 
         update_job(
@@ -1120,39 +1255,43 @@ def download_worker(
             stage="FINALIZING",
 
             message=(
-                "Download finished. "
-                "Locating the final output file."
+                "Locating final processed file."
             ),
 
             progress=100,
         )
 
-        # Give FFmpeg/postprocessors a tiny moment
-        # to finish filesystem operations.
-        time.sleep(0.25)
+        time.sleep(
+            0.3
+        )
 
         files = []
 
         if output_dir.exists():
 
-            for p in output_dir.iterdir():
+            for path in output_dir.iterdir():
 
-                if not p.is_file():
+                if not path.is_file():
                     continue
 
-                if p.name.endswith(".part"):
+                if path.name.endswith(
+                    ".part"
+                ):
                     continue
 
-                if p.name.endswith(".ytdl"):
+                if path.name.endswith(
+                    ".ytdl"
+                ):
                     continue
 
-                files.append(p)
+                files.append(
+                    path
+                )
 
         if not files:
             raise RuntimeError(
-                "yt-dlp reported completion, "
-                "but no final output file was found "
-                "inside the job output directory."
+                "yt-dlp completed, but no final "
+                "output file was found."
             )
 
         files.sort(
@@ -1164,13 +1303,8 @@ def download_worker(
 
         if final_file.stat().st_size <= 0:
             raise RuntimeError(
-                "The output file was created, "
-                "but its size is zero bytes."
+                "Final output file has zero bytes."
             )
-
-        # ----------------------------------------------------
-        # SUCCESS
-        # ----------------------------------------------------
 
         update_job(
             job_id,
@@ -1180,7 +1314,7 @@ def download_worker(
             stage="COMPLETED",
 
             message=(
-                "Download completed successfully."
+                "Server-side processing completed."
             ),
 
             progress=100,
@@ -1195,7 +1329,9 @@ def download_worker(
 
             filename=final_file.name,
 
-            file_path=str(final_file),
+            file_path=str(
+                final_file
+            ),
 
             completed_at=time.time(),
 
@@ -1206,23 +1342,7 @@ def download_worker(
             error_details=None,
         )
 
-        # IMPORTANT:
-        #
-        # DO NOT DELETE output_dir here.
-        #
-        # /download/file/{job_id} still needs
-        # the completed file.
-        #
-
     except yt_dlp.utils.DownloadError as exc:
-
-        error_text = str(exc).strip()
-
-        if not error_text:
-            error_text = (
-                "yt-dlp returned an unknown "
-                "download error."
-            )
 
         update_job(
             job_id,
@@ -1237,22 +1357,22 @@ def download_worker(
 
             error_type="YTDLPError",
 
-            error=error_text,
+            error=str(exc),
 
             error_details=(
                 traceback.format_exc()
             ),
         )
 
-    except Exception as exc:
-
-        error_text = str(exc).strip()
-
-        if not error_text:
-            error_text = (
-                "The download worker failed "
-                "without an error message."
+        try:
+            shutil.rmtree(
+                output_dir,
+                ignore_errors=True,
             )
+        except Exception:
+            pass
+
+    except Exception as exc:
 
         update_job(
             job_id,
@@ -1262,47 +1382,31 @@ def download_worker(
             stage="DOWNLOAD_ERROR",
 
             message=(
-                "Download processing failed."
+                "Server-side processing failed."
             ),
 
             error_type=type(exc).__name__,
 
-            error=error_text,
+            error=str(exc),
 
             error_details=(
                 traceback.format_exc()
             ),
         )
 
+        try:
+            shutil.rmtree(
+                output_dir,
+                ignore_errors=True,
+            )
+        except Exception:
+            pass
+
     finally:
 
         delete_cookie_file(
             cookie_file
         )
-
-        # ----------------------------------------------------
-        # IMPORTANT:
-        #
-        # Do NOT remove output_dir here.
-        #
-        # A completed job needs the directory and
-        # final file for /download/file/{job_id}.
-        #
-        # Only incomplete/error jobs are cleaned up.
-        # ----------------------------------------------------
-
-        final_job = get_job(job_id)
-
-        if final_job:
-            if final_job.get("status") == "error":
-
-                try:
-                    shutil.rmtree(
-                        output_dir,
-                        ignore_errors=True,
-                    )
-                except Exception:
-                    pass
 
 
 # ============================================================
@@ -1311,10 +1415,19 @@ def download_worker(
 
 @app.get("/")
 def root():
+
     return {
-        "name": "Video Downloader for CSR API",
-        "status": "online",
-        "version": "2.1.0",
+        "name":
+            "Video Downloader for CSR API",
+
+        "status":
+            "online",
+
+        "version":
+            "3.0.0",
+
+        "architecture":
+            "hybrid-direct-download",
     }
 
 
@@ -1325,9 +1438,13 @@ def root():
 @app.get("/health")
 def health():
 
-    def command_version(command):
+    def command_version(
+        command
+    ):
 
-        path = shutil.which(command)
+        path = shutil.which(
+            command
+        )
 
         if not path:
             return {
@@ -1336,10 +1453,14 @@ def health():
             }
 
         try:
+
             result = __import__(
                 "subprocess"
             ).run(
-                [command, "--version"],
+                [
+                    command,
+                    "--version",
+                ],
                 capture_output=True,
                 text=True,
                 timeout=10,
@@ -1351,17 +1472,18 @@ def health():
             ).strip()
 
             return {
-                "available": (
-                    result.returncode == 0
-                ),
+                "available":
+                    result.returncode == 0,
 
-                "path": path,
+                "path":
+                    path,
 
-                "version": (
-                    output.splitlines()[0]
-                    if output
-                    else None
-                ),
+                "version":
+                    (
+                        output.splitlines()[0]
+                        if output
+                        else None
+                    ),
             }
 
         except Exception as exc:
@@ -1377,56 +1499,55 @@ def health():
     )
 
     return {
-        "status": "ok",
+
+        "status":
+            "ok",
+
+        "version":
+            "3.0.0",
+
+        "architecture":
+            "hybrid-direct-download",
 
         "components": {
-            "yt_dlp": command_version(
-                "yt-dlp"
-            ),
 
-            "ffmpeg": command_version(
-                "ffmpeg"
-            ),
+            "yt_dlp":
+                command_version(
+                    "yt-dlp"
+                ),
 
-            "ffprobe": command_version(
-                "ffprobe"
-            ),
+            "ffmpeg":
+                command_version(
+                    "ffmpeg"
+                ),
 
-            "deno": command_version(
-                "deno"
-            ),
+            "ffprobe":
+                command_version(
+                    "ffprobe"
+                ),
+
+            "deno":
+                command_version(
+                    "deno"
+                ),
         },
 
         "youtube_cookies": {
-            "configured": bool(
-                cookie_value
-            ),
 
-            "key_detected": cookie_name,
+            "configured":
+                bool(
+                    cookie_value
+                ),
+
+            "key_detected":
+                cookie_name,
         },
 
         "jobs": {
-            "active": count_active_jobs(),
+            "active":
+                count_active_jobs(),
         },
     }
-
-
-def count_active_jobs():
-
-    active_states = {
-        "queued",
-        "processing",
-        "downloading",
-    }
-
-    with jobs_lock:
-
-        return sum(
-            1
-            for job in jobs.values()
-            if job.get("status")
-            in active_states
-        )
 
 
 # ============================================================
@@ -1434,7 +1555,9 @@ def count_active_jobs():
 # ============================================================
 
 @app.post("/info")
-def info(request: VideoInfoRequest):
+def info(
+    request: VideoInfoRequest
+):
 
     url = validate_url(
         request.url
@@ -1447,52 +1570,69 @@ def info(request: VideoInfoRequest):
         )
 
         video_formats, audio_formats = (
-            build_formats(video_info)
+            build_formats(
+                video_info
+            )
         )
 
         return {
-            "success": True,
 
-            "title": video_info.get(
-                "title"
-            ),
+            "success":
+                True,
 
-            "uploader": video_info.get(
-                "uploader"
-            ),
+            "title":
+                video_info.get(
+                    "title"
+                ),
 
-            "channel": video_info.get(
-                "channel"
-            ),
+            "uploader":
+                video_info.get(
+                    "uploader"
+                ),
 
-            "duration": video_info.get(
-                "duration"
-            ),
+            "channel":
+                video_info.get(
+                    "channel"
+                ),
 
-            "duration_string": video_info.get(
-                "duration_string"
-            ),
+            "duration":
+                video_info.get(
+                    "duration"
+                ),
 
-            "thumbnail": video_info.get(
-                "thumbnail"
-            ),
+            "duration_string":
+                video_info.get(
+                    "duration_string"
+                ),
 
-            "webpage_url": video_info.get(
-                "webpage_url"
-            ),
+            "thumbnail":
+                video_info.get(
+                    "thumbnail"
+                ),
 
-            "extractor": video_info.get(
-                "extractor_key"
-            ),
+            "webpage_url":
+                video_info.get(
+                    "webpage_url"
+                ),
 
-            "video_formats": video_formats,
+            "extractor":
+                video_info.get(
+                    "extractor_key"
+                ),
 
-            "audio_formats": audio_formats,
+            "video_formats":
+                video_formats,
+
+            "audio_formats":
+                audio_formats,
 
             "diagnostics": {
-                "youtube_cookies_configured": (
-                    cookie_source is not None
-                ),
+
+                "youtube_cookies_configured":
+                    cookie_source is not None,
+
+                "architecture":
+                    "hybrid-direct-download",
             },
         }
 
@@ -1549,7 +1689,237 @@ def info(request: VideoInfoRequest):
 
 
 # ============================================================
-# START DOWNLOAD JOB
+# DIRECT DOWNLOAD URL
+# ============================================================
+
+@app.post("/direct")
+def direct_download(
+    request: DirectRequest
+):
+
+    url = validate_url(
+        request.url
+    )
+
+    if not request.format_id:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error_type":
+                    "MissingFormat",
+
+                "stage":
+                    "DIRECT_REQUEST",
+
+                "message":
+                    "format_id is required.",
+            },
+        )
+
+    try:
+
+        info_data, cookie_source = (
+            extract_info(
+                url
+            )
+        )
+
+        selected = find_format(
+            info_data,
+            request.format_id
+        )
+
+        if not selected:
+
+            raise HTTPException(
+                status_code=404,
+
+                detail={
+                    "error_type":
+                        "FormatNotFound",
+
+                    "stage":
+                        "DIRECT_FORMAT",
+
+                    "message":
+                        (
+                            "The requested format "
+                            "is no longer available."
+                        ),
+                },
+            )
+
+        direct_url = get_direct_url(
+            selected
+        )
+
+        if not direct_url:
+
+            raise HTTPException(
+                status_code=409,
+
+                detail={
+                    "error_type":
+                        "DirectDownloadUnavailable",
+
+                    "stage":
+                        "DIRECT_FORMAT",
+
+                    "message":
+                        (
+                            "This format cannot be "
+                            "downloaded directly by the phone. "
+                            "Server-side processing is required."
+                        ),
+                },
+            )
+
+        filename_base = sanitize_filename(
+            info_data.get(
+                "title"
+            )
+        )
+
+        ext = str(
+            selected.get(
+                "ext"
+            )
+            or "bin"
+        )
+
+        filename = (
+            filename_base
+            + "."
+            + ext
+        )
+
+        headers = (
+            selected.get(
+                "http_headers"
+            )
+            or {}
+        )
+
+        # Do not expose cookie headers.
+        safe_headers = {}
+
+        for key, value in headers.items():
+
+            key_lower = str(
+                key
+            ).lower()
+
+            if key_lower in (
+                "cookie",
+                "authorization",
+                "proxy-authorization",
+            ):
+                continue
+
+            safe_headers[
+                str(key)
+            ] = str(value)
+
+        return {
+
+            "success":
+                True,
+
+            "mode":
+                "direct",
+
+            "format_id":
+                str(
+                    selected.get(
+                        "format_id"
+                    )
+                ),
+
+            "url":
+                direct_url,
+
+            "filename":
+                filename,
+
+            "ext":
+                ext,
+
+            "filesize":
+                get_format_size(
+                    selected
+                ),
+
+            "filesize_mb":
+                format_size(
+                    get_format_size(
+                        selected
+                    )
+                ),
+
+            "headers":
+                safe_headers,
+
+            "cookies_configured":
+                cookie_source is not None,
+        }
+
+    except HTTPException:
+        raise
+
+    except RuntimeError as exc:
+
+        raise HTTPException(
+            status_code=500,
+
+            detail={
+                "error_type":
+                    "CookieConfigurationError",
+
+                "stage":
+                    "DIRECT_COOKIE",
+
+                "message":
+                    str(exc),
+            },
+        )
+
+    except yt_dlp.utils.DownloadError as exc:
+
+        raise HTTPException(
+            status_code=422,
+
+            detail={
+                "error_type":
+                    "YTDLPError",
+
+                "stage":
+                    "DIRECT_EXTRACTION",
+
+                "message":
+                    str(exc),
+            },
+        )
+
+    except Exception as exc:
+
+        raise HTTPException(
+            status_code=500,
+
+            detail={
+                "error_type":
+                    type(exc).__name__,
+
+                "stage":
+                    "DIRECT_REQUEST",
+
+                "message":
+                    str(exc),
+            },
+        )
+
+
+# ============================================================
+# START SERVER-SIDE JOB
 # ============================================================
 
 @app.post("/download")
@@ -1576,10 +1946,11 @@ def start_download(
                 "stage":
                     "REQUEST_VALIDATION",
 
-                "message": (
-                    "mode must be "
-                    "'video' or 'audio'."
-                ),
+                "message":
+                    (
+                        "mode must be "
+                        "'video' or 'audio'."
+                    ),
             },
         )
 
@@ -1600,27 +1971,64 @@ def start_download(
             },
         )
 
+    # --------------------------------------------------------
+    # IMPORTANT:
+    #
+    # This endpoint is ONLY for operations that really need
+    # the server:
+    #
+    #   MP3 conversion
+    #   video-only + audio merge
+    #
+    # Progressive video, M4A and Opus should use /direct.
+    # --------------------------------------------------------
+
+    if request.mode == "audio":
+
+        if request.audio_codec != "mp3":
+
+            raise HTTPException(
+                status_code=400,
+
+                detail={
+                    "error_type":
+                        "DirectDownloadRequired",
+
+                    "stage":
+                        "ARCHITECTURE",
+
+                    "message":
+                        (
+                            "M4A and Opus should be "
+                            "downloaded directly to the phone."
+                        ),
+                },
+            )
+
     cleanup_old_jobs()
 
     job_id = create_job()
 
     request_data = {
-        "url": url,
 
-        "mode": request.mode,
+        "url":
+            url,
 
-        "format_id": request.format_id,
+        "mode":
+            request.mode,
 
-        "quality": request.quality,
+        "format_id":
+            request.format_id,
 
-        "audio_codec": request.audio_codec,
+        "quality":
+            request.quality,
 
-        "audio_bitrate": request.audio_bitrate,
+        "audio_codec":
+            request.audio_codec,
+
+        "audio_bitrate":
+            request.audio_bitrate,
     }
-
-    # Mark this BEFORE creating the thread so
-    # the client immediately knows the worker is
-    # being launched.
 
     update_job(
         job_id,
@@ -1630,13 +2038,14 @@ def start_download(
         stage="STARTING_WORKER",
 
         message=(
-            "Starting download worker."
+            "Starting required server-side processing."
         ),
     )
 
     try:
 
         thread = threading.Thread(
+
             target=download_worker,
 
             args=(
@@ -1647,7 +2056,7 @@ def start_download(
             daemon=True,
 
             name=(
-                "csr-download-"
+                "csr-server-job-"
                 + job_id[:12]
             ),
         )
@@ -1658,8 +2067,7 @@ def start_download(
             job_id,
 
             message=(
-                "Download worker started. "
-                "Waiting for media processing."
+                "Server-side processing worker started."
             ),
         )
 
@@ -1673,13 +2081,16 @@ def start_download(
             stage="WORKER_START_ERROR",
 
             message=(
-                "The server could not start "
-                "the download worker."
+                "Could not start server-side worker."
             ),
 
-            error_type=type(exc).__name__,
+            error_type=type(
+                exc
+            ).__name__,
 
-            error=str(exc),
+            error=str(
+                exc
+            ),
 
             error_details=(
                 traceback.format_exc()
@@ -1702,17 +2113,23 @@ def start_download(
         )
 
     return {
-        "success": True,
 
-        "job_id": job_id,
+        "success":
+            True,
 
-        "status": "processing",
+        "job_id":
+            job_id,
 
-        "stage": "STARTING_WORKER",
+        "status":
+            "processing",
 
-        "message": (
-            "Download worker started."
-        ),
+        "stage":
+            "STARTING_WORKER",
+
+        "message":
+            (
+                "Server-side processing started."
+            ),
     }
 
 
@@ -1720,7 +2137,9 @@ def start_download(
 # JOB STATUS
 # ============================================================
 
-@app.get("/download/status/{job_id}")
+@app.get(
+    "/download/status/{job_id}"
+)
 def download_status(
     job_id: str
 ):
@@ -1742,22 +2161,31 @@ def download_status(
                     "JOB_STATUS",
 
                 "message":
-                    "Download job was not found.",
+                    (
+                        "This server-side job no longer "
+                        "exists. The Render process may "
+                        "have restarted."
+                    ),
             },
         )
 
     return {
-        "success": True,
 
-        "job": job,
+        "success":
+            True,
+
+        "job":
+            job,
     }
 
 
 # ============================================================
-# DOWNLOAD FILE
+# SERVER FILE
 # ============================================================
 
-@app.get("/download/file/{job_id}")
+@app.get(
+    "/download/file/{job_id}"
+)
 def download_file(
     job_id: str
 ):
@@ -1779,11 +2207,13 @@ def download_file(
                     "FILE_DOWNLOAD",
 
                 "message":
-                    "Download job was not found.",
+                    "Server-side job was not found.",
             },
         )
 
-    if job["status"] != "completed":
+    if job.get(
+        "status"
+    ) != "completed":
 
         raise HTTPException(
             status_code=409,
@@ -1796,7 +2226,10 @@ def download_file(
                     "FILE_DOWNLOAD",
 
                 "message":
-                    "The download is not completed yet.",
+                    (
+                        "The server-side file "
+                        "is not completed yet."
+                    ),
             },
         )
 
@@ -1806,7 +2239,9 @@ def download_file(
 
     if (
         not path
-        or not os.path.isfile(path)
+        or not os.path.isfile(
+            path
+        )
     ):
 
         raise HTTPException(
@@ -1819,15 +2254,16 @@ def download_file(
                 "stage":
                     "FILE_DOWNLOAD",
 
-                "message": (
-                    "The completed file is "
-                    "no longer available on "
-                    "the server."
-                ),
+                "message":
+                    (
+                        "The completed server-side "
+                        "file is no longer available."
+                    ),
             },
         )
 
     return FileResponse(
+
         path=path,
 
         filename=job.get(
@@ -1858,6 +2294,8 @@ if __name__ == "__main__":
 
     uvicorn.run(
         app,
+
         host="0.0.0.0",
+
         port=port,
     )
