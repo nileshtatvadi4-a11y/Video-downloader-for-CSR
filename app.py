@@ -2,12 +2,18 @@ import os
 import shutil
 import subprocess
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+import yt_dlp
 
 app = FastAPI(
-    title="CSR Video Downloader API",
-    version="1.0.0",
+    title="Video Downloader for CSR API",
+    version="1.1.0",
 )
+
+
+class VideoInfoRequest(BaseModel):
+    url: str
 
 
 def check_command(command):
@@ -73,10 +79,94 @@ def check_command(command):
         }
 
 
+def get_video_info(url):
+    ydl_options = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "noplaylist": True,
+        "extract_flat": False,
+    }
+
+    with yt_dlp.YoutubeDL(ydl_options) as ydl:
+        return ydl.extract_info(url, download=False)
+
+
+def build_format_list(info):
+    formats = info.get("formats") or []
+
+    video_formats = {}
+    audio_formats = {}
+
+    for fmt in formats:
+        format_id = fmt.get("format_id")
+        if not format_id:
+            continue
+
+        height = fmt.get("height")
+        width = fmt.get("width")
+        fps = fmt.get("fps")
+        ext = fmt.get("ext")
+        acodec = fmt.get("acodec")
+        vcodec = fmt.get("vcodec")
+        abr = fmt.get("abr")
+        tbr = fmt.get("tbr")
+        filesize = fmt.get("filesize") or fmt.get("filesize_approx")
+
+        if vcodec and vcodec != "none" and height:
+            key = (height, ext, acodec != "none")
+
+            if key not in video_formats:
+                video_formats[key] = {
+                    "format_id": format_id,
+                    "height": height,
+                    "width": width,
+                    "fps": fps,
+                    "ext": ext,
+                    "has_audio": acodec != "none",
+                    "video_codec": vcodec,
+                    "audio_codec": acodec,
+                    "filesize": filesize,
+                    "tbr": tbr,
+                }
+
+        elif acodec and acodec != "none":
+            bitrate = abr or tbr
+
+            if bitrate:
+                key = (round(bitrate), ext)
+
+                if key not in audio_formats:
+                    audio_formats[key] = {
+                        "format_id": format_id,
+                        "bitrate_kbps": round(bitrate),
+                        "ext": ext,
+                        "audio_codec": acodec,
+                        "filesize": filesize,
+                    }
+
+    video_list = sorted(
+        video_formats.values(),
+        key=lambda item: (
+            item.get("height") or 0,
+            item.get("tbr") or 0,
+        ),
+        reverse=True,
+    )
+
+    audio_list = sorted(
+        audio_formats.values(),
+        key=lambda item: item.get("bitrate_kbps") or 0,
+        reverse=True,
+    )
+
+    return video_list, audio_list
+
+
 @app.get("/")
 def root():
     return {
-        "name": "CSR Video Downloader API",
+        "name": "Video Downloader for CSR API",
         "status": "online",
     }
 
@@ -99,6 +189,60 @@ def health():
         "status": "ok" if all_available else "degraded",
         "components": components,
     }
+
+
+@app.post("/info")
+def info(request: VideoInfoRequest):
+    url = request.url.strip()
+
+    if not url:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error_type": "InvalidURL",
+                "stage": "URL_VALIDATION",
+                "message": "The URL cannot be empty.",
+            },
+        )
+
+    try:
+        video_info = get_video_info(url)
+
+        video_formats, audio_formats = build_format_list(video_info)
+
+        return {
+            "success": True,
+            "title": video_info.get("title"),
+            "uploader": video_info.get("uploader"),
+            "channel": video_info.get("channel"),
+            "duration": video_info.get("duration"),
+            "duration_string": video_info.get("duration_string"),
+            "thumbnail": video_info.get("thumbnail"),
+            "webpage_url": video_info.get("webpage_url"),
+            "extractor": video_info.get("extractor_key"),
+            "video_formats": video_formats,
+            "audio_formats": audio_formats,
+        }
+
+    except yt_dlp.utils.DownloadError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "error_type": "YTDLPError",
+                "stage": "VIDEO_INFORMATION",
+                "message": str(exc),
+            },
+        )
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error_type": "ServerError",
+                "stage": "VIDEO_INFORMATION",
+                "message": str(exc),
+            },
+        )
 
 
 if __name__ == "__main__":
