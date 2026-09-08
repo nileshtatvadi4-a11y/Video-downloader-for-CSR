@@ -22,18 +22,19 @@ def check_command(command):
 
     try:
         result = subprocess.run(
-            [command, "--version"],
+            [command, "-version"],
             capture_output=True,
             text=True,
             timeout=10,
         )
 
         output = (result.stdout or result.stderr).strip()
+        first_line = output.splitlines()[0] if output else None
 
         return {
             "available": result.returncode == 0,
             "path": path,
-            "version": output,
+            "version": first_line,
         }
 
     except Exception as exc:
